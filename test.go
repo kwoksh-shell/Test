@@ -1,284 +1,298 @@
-package singleFlight
-
-import (
-	"fmt"
-	"sync"
-)
-
-type call struct {
-	wg  sync.WaitGroup
-	val interface{}
-	err error
+type lruCache struct {
+	mu              sync.RWMutex
+	list            *list.List               // 双向链表，用于维护 LRU 顺序
+	items           map[string]*list.Element // 键到链表节点的映射
+	expires         map[string]time.Time     // 过期时间映射
+	maxBytes        int64                    // 最大允许字节数
+	usedBytes       int64                    // 当前使用的字节数
+	onEvicted       func(key string, value Value)
+	cleanupInterval time.Duration
+	cleanupTicker   *time.Ticker
+	closeCh         chan struct{} // 用于优雅关闭清理协程
 }
 
-type Group struct {
-	m sync.Map
+// lruEntry 表示缓存中的一个条目
+type lruEntry struct {
+	key   string
+	value Value
 }
 
-func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
-	if existing, ok := g.m.Load(key); ok {
-		c := existing.(*call)
-		c.wg.Wait()
-		fmt.Println("secondrequest")
-		return c.val, c.err
+// newLRUCache 创建一个新的 LRU 缓存实例
+func newLRUCache(opts Options) *lruCache {
+	// 设置默认清理间隔
+	cleanupInterval := opts.CleanupInterval
+	if cleanupInterval <= 0 {
+		cleanupInterval = time.Minute
 	}
-	c := &call{}
-	g.m.Store(key, c)
-	c.wg.Add(1)
-	c.val, c.err = fn()
-	c.wg.Done()
-	g.m.Delete(key)
-	return c.val, c.err
+
+	c := &lruCache{
+		list:            list.New(),
+		items:           make(map[string]*list.Element),
+		expires:         make(map[string]time.Time),
+		maxBytes:        opts.MaxBytes,
+		onEvicted:       opts.OnEvicted,
+		cleanupInterval: cleanupInterval,
+		closeCh:         make(chan struct{}),
+	}
+
+	// 启动定期清理协程
+	c.cleanupTicker = time.NewTicker(c.cleanupInterval)
+	go c.cleanupLoop()
+
+	return c
 }
 
-package consistenthash
+// Get 获取缓存项，如果存在且未过期则返回
+func (c *lruCache) Get(key string) (Value, bool) {
+	c.mu.RLock()
+	elem, ok := c.items[key]
+	if !ok {
+		c.mu.RUnlock()
+		return nil, false
+	}
 
-import (
-	"errors"
-	"fmt"
-	"math"
-	"sort"
-	"sync"
-	"sync/atomic"
-	"time"
-)
+	// 检查是否过期
+	if expTime, hasExp := c.expires[key]; hasExp && time.Now().After(expTime) {
+		c.mu.RUnlock()
 
-// Map 一致性哈希实现
-type Map struct {
-	mu sync.RWMutex
-	// 配置信息
-	config *Config
-	// 哈希环
-	keys []int
-	// 哈希环到节点的映射
-	hashMap map[int]string
-	// 节点到虚拟节点数量的映射
-	nodeReplicas map[string]int
-	// 节点负载统计
-	nodeCounts map[string]int64
-	// 总请求数
-	totalRequests int64
+		// 异步删除过期项，避免在读锁内操作
+		go c.Delete(key)
+
+		return nil, false
+	}
+
+	// 获取值并释放读锁
+	entry := elem.Value.(*lruEntry)
+	value := entry.value
+	c.mu.RUnlock()
+
+	// 更新 LRU 位置需要写锁
+	c.mu.Lock()
+	// 再次检查元素是否仍然存在（可能在获取写锁期间被其他协程删除）
+	if _, ok := c.items[key]; ok {
+		c.list.MoveToBack(elem)
+	}
+	c.mu.Unlock()
+
+	return value, true
 }
 
-// New 创建一致性哈希实例
-func New(opts ...Option) *Map {
-	m := &Map{
-		config:       DefaultConfig,
-		hashMap:      make(map[int]string),
-		nodeReplicas: make(map[string]int),
-		nodeCounts:   make(map[string]int64),
-	}
-
-	for _, opt := range opts {
-		opt(m)
-	}
-
-	m.startBalancer() // 启动负载均衡器
-	return m
+// Set 添加或更新缓存项
+func (c *lruCache) Set(key string, value Value) error {
+	return c.SetWithExpiration(key, value, 0)
 }
 
-// Option 配置选项
-type Option func(*Map)
-
-// WithConfig 设置配置
-func WithConfig(config *Config) Option {
-	return func(m *Map) {
-		m.config = config
-	}
-}
-
-// Add 添加节点
-func (m *Map) Add(nodes ...string) error {
-	if len(nodes) == 0 {
-		return errors.New("no nodes provided")
+// SetWithExpiration 添加或更新缓存项，并设置过期时间
+func (c *lruCache) SetWithExpiration(key string, value Value, expiration time.Duration) error {
+	if value == nil {
+		c.Delete(key)
+		return nil
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	for _, node := range nodes {
-		if node == "" {
-			continue
-		}
-
-		// 为节点添加虚拟节点
-		m.addNode(node, m.config.DefaultReplicas)
+	// 计算过期时间
+	var expTime time.Time
+	if expiration > 0 {
+		expTime = time.Now().Add(expiration)
+		c.expires[key] = expTime
+	} else {
+		delete(c.expires, key)
 	}
 
-	// 重新排序
-	sort.Ints(m.keys)
+	// 如果键已存在，更新值
+	if elem, ok := c.items[key]; ok {
+		oldEntry := elem.Value.(*lruEntry)
+		c.usedBytes += int64(value.Len() - oldEntry.value.Len())
+		oldEntry.value = value
+		c.list.MoveToBack(elem)
+		return nil
+	}
+
+	// 添加新项
+	entry := &lruEntry{key: key, value: value}
+	elem := c.list.PushBack(entry)
+	c.items[key] = elem
+	c.usedBytes += int64(len(key) + value.Len())
+
+	// 检查是否需要淘汰旧项
+	c.evict()
+
 	return nil
 }
 
-// Remove 移除节点
-func (m *Map) Remove(node string) error {
-	if node == "" {
-		return errors.New("invalid node")
+// Delete 从缓存中删除指定键的项
+func (c *lruCache) Delete(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, ok := c.items[key]; ok {
+		c.removeElement(elem)
+		return true
+	}
+	return false
+}
+
+// Clear 清空缓存
+func (c *lruCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 如果设置了回调函数，遍历所有项调用回调
+	if c.onEvicted != nil {
+		for _, elem := range c.items {
+			entry := elem.Value.(*lruEntry)
+			c.onEvicted(entry.key, entry.value)
+		}
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	c.list.Init()
+	c.items = make(map[string]*list.Element)
+	c.expires = make(map[string]time.Time)
+	c.usedBytes = 0
+}
 
-	replicas := m.nodeReplicas[node]
-	if replicas == 0 {
-		return fmt.Errorf("node %s not found", node)
+// Len 返回缓存中的项数
+func (c *lruCache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.list.Len()
+}
+
+// removeElement 从缓存中删除元素，调用此方法前必须持有锁
+func (c *lruCache) removeElement(elem *list.Element) {
+	entry := elem.Value.(*lruEntry)
+	c.list.Remove(elem)
+	delete(c.items, entry.key)
+	delete(c.expires, entry.key)
+	c.usedBytes -= int64(len(entry.key) + entry.value.Len())
+
+	if c.onEvicted != nil {
+		c.onEvicted(entry.key, entry.value)
 	}
+}
 
-	// 移除节点的所有虚拟节点
-	for i := 0; i < replicas; i++ {
-		hash := int(m.config.HashFunc([]byte(fmt.Sprintf("%s-%d", node, i))))
-		delete(m.hashMap, hash)
-		for j := 0; j < len(m.keys); j++ {
-			if m.keys[j] == hash {
-				m.keys = append(m.keys[:j], m.keys[j+1:]...)
-				break
+// evict 清理过期和超出内存限制的缓存，调用此方法前必须持有锁
+func (c *lruCache) evict() {
+	// 先清理过期项
+	now := time.Now()
+	for key, expTime := range c.expires {
+		if now.After(expTime) {
+			if elem, ok := c.items[key]; ok {
+				c.removeElement(elem)
 			}
 		}
 	}
 
-	delete(m.nodeReplicas, node)
-	delete(m.nodeCounts, node)
-	return nil
-}
-
-// Get 获取节点
-func (m *Map) Get(key string) string {
-	if key == "" {
-		return ""
-	}
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if len(m.keys) == 0 {
-		return ""
-	}
-
-	hash := int(m.config.HashFunc([]byte(key)))
-	// 二分查找
-	idx := sort.Search(len(m.keys), func(i int) bool {
-		return m.keys[i] >= hash
-	})
-
-	// 处理边界情况
-	if idx == len(m.keys) {
-		idx = 0
-	}
-
-	node := m.hashMap[m.keys[idx]]
-	count := m.nodeCounts[node]
-	m.nodeCounts[node] = count + 1
-	atomic.AddInt64(&m.totalRequests, 1)
-
-	return node
-}
-
-// addNode 添加节点的虚拟节点
-func (m *Map) addNode(node string, replicas int) {
-	for i := 0; i < replicas; i++ {
-		hash := int(m.config.HashFunc([]byte(fmt.Sprintf("%s-%d", node, i))))
-		m.keys = append(m.keys, hash)
-		m.hashMap[hash] = node
-	}
-	m.nodeReplicas[node] = replicas
-}
-
-// checkAndRebalance 检查并重新平衡虚拟节点
-func (m *Map) checkAndRebalance() {
-	if atomic.LoadInt64(&m.totalRequests) < 1000 {
-		return // 样本太少，不进行调整
-	}
-
-	// 计算负载情况
-	avgLoad := float64(m.totalRequests) / float64(len(m.nodeReplicas))
-	var maxDiff float64
-
-	for _, count := range m.nodeCounts {
-		diff := math.Abs(float64(count) - avgLoad)
-		if diff/avgLoad > maxDiff {
-			maxDiff = diff / avgLoad
+	// 再根据内存限制清理最久未使用的项
+	for c.maxBytes > 0 && c.usedBytes > c.maxBytes && c.list.Len() > 0 {
+		elem := c.list.Front() // 获取最久未使用的项（链表头部）
+		if elem != nil {
+			c.removeElement(elem)
 		}
-	}
-
-	// 如果负载不均衡度超过阈值，调整虚拟节点
-	if maxDiff > m.config.LoadBalanceThreshold {
-		m.rebalanceNodes()
 	}
 }
 
-// rebalanceNodes 重新平衡节点
-func (m *Map) rebalanceNodes() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	avgLoad := float64(m.totalRequests) / float64(len(m.nodeReplicas))
-
-	// 调整每个节点的虚拟节点数量
-	for node, count := range m.nodeCounts {
-		currentReplicas := m.nodeReplicas[node]
-		loadRatio := float64(count) / avgLoad
-
-		var newReplicas int
-		if loadRatio > 1 {
-			// 负载过高，减少虚拟节点
-			newReplicas = int(float64(currentReplicas) / loadRatio)
-		} else {
-			// 负载过低，增加虚拟节点
-			newReplicas = int(float64(currentReplicas) * (2 - loadRatio))
-		}
-
-		// 确保在限制范围内
-		if newReplicas < m.config.MinReplicas {
-			newReplicas = m.config.MinReplicas
-		}
-		if newReplicas > m.config.MaxReplicas {
-			newReplicas = m.config.MaxReplicas
-		}
-
-		if newReplicas != currentReplicas {
-			// 重新添加节点的虚拟节点
-			if err := m.Remove(node); err != nil {
-				continue // 如果移除失败，跳过这个节点
-			}
-			m.addNode(node, newReplicas)
+// cleanupLoop 定期清理过期缓存的协程
+func (c *lruCache) cleanupLoop() {
+	for {
+		select {
+		case <-c.cleanupTicker.C:
+			c.mu.Lock()
+			c.evict()
+			c.mu.Unlock()
+		case <-c.closeCh:
+			return
 		}
 	}
-
-	// 重置计数器
-	for node := range m.nodeCounts {
-		m.nodeCounts[node] = 0
-	}
-	atomic.StoreInt64(&m.totalRequests, 0)
-
-	// 重新排序
-	sort.Ints(m.keys)
 }
 
-// GetStats 获取负载统计信息
-func (m *Map) GetStats() map[string]float64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	stats := make(map[string]float64)
-	total := atomic.LoadInt64(&m.totalRequests)
-	if total == 0 {
-		return stats
+// Close 关闭缓存，停止清理协程
+func (c *lruCache) Close() {
+	if c.cleanupTicker != nil {
+		c.cleanupTicker.Stop()
+		close(c.closeCh)
 	}
-
-	for node, count := range m.nodeCounts {
-		stats[node] = float64(count) / float64(total)
-	}
-	return stats
 }
 
-// 将checkAndRebalance移到单独的goroutine中
-func (m *Map) startBalancer() {
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
+// GetWithExpiration 获取缓存项及其剩余过期时间
+func (c *lruCache) GetWithExpiration(key string) (Value, time.Duration, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-		for range ticker.C {
-			m.checkAndRebalance()
+	elem, ok := c.items[key]
+	if !ok {
+		return nil, 0, false
+	}
+
+	// 检查是否过期
+	now := time.Now()
+	if expTime, hasExp := c.expires[key]; hasExp {
+		if now.After(expTime) {
+			// 已过期
+			return nil, 0, false
 		}
-	}()
+
+		// 计算剩余过期时间
+		ttl := expTime.Sub(now)
+		c.list.MoveToBack(elem)
+		return elem.Value.(*lruEntry).value, ttl, true
+	}
+
+	// 无过期时间
+	c.list.MoveToBack(elem)
+	return elem.Value.(*lruEntry).value, 0, true
+}
+
+// GetExpiration 获取键的过期时间
+func (c *lruCache) GetExpiration(key string) (time.Time, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	expTime, ok := c.expires[key]
+	return expTime, ok
+}
+
+// UpdateExpiration 更新过期时间
+func (c *lruCache) UpdateExpiration(key string, expiration time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.items[key]; !ok {
+		return false
+	}
+
+	if expiration > 0 {
+		c.expires[key] = time.Now().Add(expiration)
+	} else {
+		delete(c.expires, key)
+	}
+
+	return true
+}
+
+// UsedBytes 返回当前使用的字节数
+func (c *lruCache) UsedBytes() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.usedBytes
+}
+
+// MaxBytes 返回最大允许字节数
+func (c *lruCache) MaxBytes() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.maxBytes
+}
+
+// SetMaxBytes 设置最大允许字节数并触发淘汰
+func (c *lruCache) SetMaxBytes(maxBytes int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.maxBytes = maxBytes
+	if maxBytes > 0 {
+		c.evict()
+	}
 }
