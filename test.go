@@ -45,6 +45,30 @@ func buildTree(node []string) *TreeNode {
 	return root
 }
 
+func findNode(root *TreeNode, val int) *TreeNode {
+	if root == nil {
+		return nil
+	}
+	queue := []*TreeNode{root}
+	for len(queue) > 0 {
+		size := len(queue)
+		for i := 0; i < size; i++ {
+			node := queue[0]
+			queue = queue[1:]
+			if node.Val == val {
+				return node
+			}
+			if node.Left != nil {
+				queue = append(queue, node.Left)
+			}
+			if node.Right != nil {
+				queue = append(queue, node.Right)
+			}
+		}
+	}
+	return nil
+}
+
 func PrintTree(root *TreeNode) {
 	if root == nil {
 		fmt.Println("null")
@@ -135,6 +159,23 @@ func rootSum(root *TreeNode, targetSum int) int {
 	return res
 }
 
+func lowestCommonAncestor(root, p, q *TreeNode) *TreeNode {
+	if root == nil || root == p || root == q {
+		return root
+	}
+	left := lowestCommonAncestor(root.Left, p, q)
+	right := lowestCommonAncestor(root.Right, p, q)
+	if left != nil && right != nil {
+		return root
+	} else if left == nil && right == nil {
+		return nil
+	} else if left == nil {
+		return right
+	} else {
+		return left
+	}
+}
+
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Scan()
@@ -144,7 +185,10 @@ func main() {
 		nums = append(nums, numLine[i])
 	}
 	root := buildTree(nums)
-	var targetSum int
-	fmt.Scan(&targetSum)
-	fmt.Println(pathSum(root, targetSum))
+	var p, q int
+	fmt.Scan(&p, &q)
+	Tree1 := findNode(root, p)
+	Tree2 := findNode(root, q)
+	result := lowestCommonAncestor(root, Tree1, Tree2)
+	fmt.Println(result.Val)
 }
